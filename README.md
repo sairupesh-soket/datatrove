@@ -34,6 +34,7 @@ Local, remote and other file systems are supported through [fsspec](https://file
     + [Benchmarking](#benchmarking)
   * [Extracting text](#extracting-text)
   * [Filtering data](#filtering-data)
+    + [Validating SFT chat data](#validating-sft-chat-data)
   * [Saving data](#saving-data)
   * [Deduplicating data](#deduplicating-data)
   * [Summary Statistics](#summary-statistics)
@@ -445,6 +446,24 @@ You can use [extractors](src/datatrove/pipeline/extractors) to extract text cont
 
 ### Filtering data
 [Filters](src/datatrove/pipeline/filters) are some of the most important blocks of any data processing pipeline. Datatrove's filter blocks take a `Document` and return a boolean (`True` to keep a document, `False` to remove it). Removed samples do not continue to the next pipeline stage. You can also save the removed samples to disk by passing a [Writer](src/datatrove/pipeline/writers) to the `exclusion_writer` parameter.
+
+#### Validating SFT chat data
+[`SFTValidationFilter`](src/datatrove/pipeline/filters/sft_validation_filter.py) checks SFT rows in the OpenAI chat format (`{"messages": [...], "tools": [...]}`) and **only flags** them: it adds the broken rule ids to `doc.metadata["sft_flags"]` (FLAG rules) and `doc.metadata["sft_info"]` (information only), counts every rule in the step stats, and keeps every document. A row passes when reasoning is only in `reasoning_content`, tool calls only in `tool_calls`, tool results only in `role: "tool"` messages, and the text has no template tokens or hidden turns. The rules are in [`datatrove.utils.sft_validation`](src/datatrove/utils/sft_validation).
+
+Read the rows with `sft_chat_adapter`, which keeps each raw row unchanged as JSON in `text` and stores the 1-based line number in `metadata["line"]`:
+```python
+from datatrove.pipeline.filters import SFTValidationFilter, sft_chat_adapter
+from datatrove.pipeline.readers import JsonlReader
+
+pipeline = [
+    JsonlReader("data/sft/", adapter=sft_chat_adapter),
+    SFTValidationFilter(),  # label_only=True: nothing is removed
+    ...
+]
+```
+Pass `render_check=ChatTemplateRenderCheck(spm_path, chat_template_path)` to also render every `render_every`-th row with the training chat template (needs `sentencepiece` and `jinja2`). See [examples/sft_validation.py](examples/sft_validation.py) for a pipeline that writes a report of the flagged rows (file, line, rule ids).
+
+Note: `JsonlReader` skips lines that are not valid JSON (they are not flagged) and fails on lines that are valid JSON but not an object (e.g. `null`).
 
 ### Saving data
 Once you are done processing your data you will probably want to save it somewhere. For this you can use a [writer](src/datatrove/pipeline/writers/jsonl.py).

@@ -7,5 +7,6 @@ from .lambda_filter import LambdaFilter
 from .language_filter import LanguageFilter
 from .regex_filter import RegexFilter
 from .sampler_filter import SamplerFilter
+from .sft_validation_filter import SFTValidationFilter, sft_chat_adapter
 from .unigram_log_probs import UnigramLogProbFilter
 from .url_filter import URLFilter
