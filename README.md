@@ -6,10 +6,91 @@ DataTrove processing pipelines are platform-agnostic, running out of the box loc
 
 Local, remote and other file systems are supported through [fsspec](https://filesystem-spec.readthedocs.io/en/latest/).
 
+## SFT validation (this fork)
+
+This fork adds a validation step for SFT data in the OpenAI chat format (one `{"messages": [...], "tools": [...]}` object per JSONL line). It is a port of the validation part of `sft-data-pipeline`, with the same 68 rules and the same rule ids.
+
+The validation **only flags** rows. It does not change rows and it does not remove rows. A row passes when every piece of information is in its own OpenAI field:
+- reasoning only in `reasoning_content`,
+- tool calls only in `tool_calls`, with `arguments` as a JSON string,
+- tool results only in `role: "tool"` messages,
+- no chat-template tokens, reasoning tags or hidden chat turns in the text.
+
+### Run it
+
+```bash
+uv venv --python 3.12 && uv sync --extra io      # or: pip install -e ".[io]"
+python examples/sft_validation.py DATA_FOLDER REPORT_FOLDER LOGS_FOLDER --tasks 32
+```
+
+To also check the rows with the eka chat template (the `RENDER` rule, on 1 row in each 100 rows), install `sentencepiece` and `jinja2` and add:
+
+```bash
+--spm_path /path/eka_v0_1_1.model --chat_template_path /path/chat_template.jinja [--render_every 100]
+```
+
+The script reads all `.jsonl` and `.jsonl.gz` files in `DATA_FOLDER`. It skips files and folders whose name starts with `_` (logs, backups, rejects).
+
+### Output
+
+| Path | Content |
+|---|---|
+| `REPORT_FOLDER/<rank>.jsonl` | One line for each flagged row: `file_path`, `line` (1-based), `sft_flags`, `sft_info` |
+| `LOGS_FOLDER/stats.json` | Number of rows for each rule id, and `rows_flagged`, `rows_info_only`, `rows_clean` |
+
+### Use it in your own pipeline
+
+```python
+from datatrove.pipeline.filters import SFTValidationFilter, sft_chat_adapter
+from datatrove.pipeline.readers import JsonlReader
+
+pipeline = [
+    JsonlReader("DATA_FOLDER", adapter=sft_chat_adapter),  # keeps the raw row as JSON in doc.text
+    SFTValidationFilter(),  # adds doc.metadata["sft_flags"] and doc.metadata["sft_info"]
+    ...
+]
+```
+
+- `sft_chat_adapter` is necessary: SFT rows have no `text` key, so the default reader skips them.
+- `doc.metadata["sft_flags"]`: FLAG rules (the row has the problem). `doc.metadata["sft_info"]`: INFO rules (information only).
+- See [Validating SFT chat data](#validating-sft-chat-data) for all options.
+
+### Rules (68)
+
+| Group | Rules | Label |
+|---|---|---|
+| Conversation structure | `AUDIT_does_not_end_with_assistant`, `AUDIT_system_then_assistant`, `AUDIT_first_turn_not_user`, `AUDIT_system_not_first`, `AUDIT_user_user`, `AUDIT_assistant_assistant` | FLAG |
+| OpenAI format | `FORMAT_bad_shape`, `AUDIT_empty_messages`, `AUDIT_non_openai_top_key`, `AUDIT_unknown_role`, `AUDIT_unknown_msg_key`, `AUDIT_content_not_string`, `AUDIT_reasoning_on_non_assistant`, `AUDIT_args_not_json_string`, `AUDIT_args_invalid_json`, `TOOL_malformed`, `AUDIT_tool_call_no_id`, `AUDIT_tool_call_no_name`, `FORMAT_tool_call_type`, `AUDIT_tool_call_not_in_tools`, `AUDIT_tool_calls_but_no_tools`, `AUDIT_tool_def_bad_shape`, `AUDIT_tool_without_call`, `AUDIT_tool_without_id`, `AUDIT_tool_id_mismatch`, `TOOL_call_without_reply`, `TOOL_duplicate_call_id`, `FORMAT_tool_message_name` | FLAG |
+| Empty content | `AUDIT_empty_user`, `AUDIT_empty_assistant`, `AUDIT_final_answer_empty` | FLAG |
+| Reasoning in the answer text | `THINK_in_content`, `AUDIT_think_tag_left`, `AUDIT_other_reasoning_tags`, `EMBED_reasoning_tag`, `REASON_in_answer`, `GEN_artifact_in_answer`, `RC_equals_answer`, `AUDIT_reasoning_is_problem_creation` | FLAG |
+| Tool calls, tool results and turns hidden in the text | `TOOLCALL_as_text`, `EMBED_tool_call_text`, `EMBED_tool_result_text`, `EMBED_role_turns`, `EMBED_agent_text_protocol`, `SYS_tools_promised_but_no_tools`, `USER_embedded_transcript`, `USER_python_repr_messages` | FLAG |
+| Special tokens and template render | `AUDIT_special_token_leak`, `EKA_T1`, `RENDER` (only with `--spm_path` and `--chat_template_path`) | FLAG |
+| Text quality | `AUDIT_replacement_char`, `AUDIT_mojibake`, `AUDIT_control_chars`, `AUDIT_repetition_loop`, `AUDIT_harness_error_text`, `AUDIT_output_limit_loop`, `AUDIT_degenerate_answer`, `AUDIT_answer_equals_prompt`, `LITERAL_backslash_n`, `CODE_newlines_collapsed`, `PDF_hard_line_breaks` | FLAG |
+| Safety, identity and sources | `BACKDOOR`, `IDENTITY`, `SRC_incorrect_solutions` | FLAG |
+| Information only | `END_single_call`, `END_traj_stops`, `AUDIT_unfilled_template`, `INFO_as_an_AI_language_model` | INFO |
+
+Some rule ids have a detail after the name, for example `FORMAT_bad_shape:messages_not_list`, `EKA_T1_assistant`, `IDENTITY_OpenAI_ChatGPT` or `RENDER_render_mismatch:think`.
+
+### Code
+
+| Path | Content |
+|---|---|
+| [`src/datatrove/pipeline/filters/sft_validation_filter.py`](src/datatrove/pipeline/filters/sft_validation_filter.py) | `SFTValidationFilter` (the pipeline step) and `sft_chat_adapter` |
+| [`src/datatrove/utils/sft_validation/`](src/datatrove/utils/sft_validation) | The rules: `audit.py` (base rules), `rules.py` (all other rules), `render.py` (eka template check) |
+| [`examples/sft_validation.py`](examples/sft_validation.py) | Script that writes the report of flagged rows |
+| [`tests/pipeline/filters/test_sft_validation.py`](tests/pipeline/filters/test_sft_validation.py) | Tests, with a flagged and a correct example row for each rule |
+
+### Known limits
+
+- Lines that are not valid JSON are skipped by the reader with a warning. They are not flagged (no `AUDIT_bad_json`).
+- `JsonlReader` stops with an error on lines that are valid JSON but not an object (for example `null` or `[1, 2]`).
+- The eka template check renders 1 row in each `render_every` rows of each task.
+
 ## Table of contents
 
 <!-- toc -->
 
+- [SFT validation (this fork)](#sft-validation-this-fork)
 - [Installation](#installation)
 - [Quickstart examples](#quickstart-examples)
 - [Terminology](#terminology)
