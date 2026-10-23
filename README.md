@@ -1,14 +1,6 @@
-# DataTrove
+# SFT validation
 
-DataTrove is a library to process, filter and deduplicate text data at a very large scale. It provides a set of prebuilt commonly used processing blocks with a framework to easily add custom functionality.
-
-DataTrove processing pipelines are platform-agnostic, running out of the box locally or on a slurm cluster. Its (relatively) low memory usage and multiple step design makes it ideal for large workloads, such as to process an LLM's training data.
-
-Local, remote and other file systems are supported through [fsspec](https://filesystem-spec.readthedocs.io/en/latest/).
-
-## SFT validation (this fork)
-
-This fork adds a validation step for SFT data in the OpenAI chat format (one `{"messages": [...], "tools": [...]}` object per JSONL line). It is a port of the validation part of `sft-data-pipeline`, with the same 68 rules and the same rule ids.
+Validation for SFT data in the OpenAI chat format: one `{"messages": [...], "tools": [...]}` object per JSONL line. It is a port of the validation part of `sft-data-pipeline` to a [datatrove](https://github.com/huggingface/datatrove) pipeline step, with the same 68 rules and the same rule ids.
 
 The validation **only flags** rows. It does not change rows and it does not remove rows. A row passes when every piece of information is in its own OpenAI field:
 - reasoning only in `reasoning_content`,
@@ -16,46 +8,123 @@ The validation **only flags** rows. It does not change rows and it does not remo
 - tool results only in `role: "tool"` messages,
 - no chat-template tokens, reasoning tags or hidden chat turns in the text.
 
-### Run it
+## Target format
+
+```json
+{"messages": [
+   {"role": "system", "content": "..."},
+   {"role": "user", "content": "..."},
+   {"role": "assistant", "content": "", "tool_calls": [{"id": "call_0", "type": "function",
+        "function": {"name": "get_time", "arguments": "{\"city\": \"Rome\"}"}}]},
+   {"role": "tool", "tool_call_id": "call_0", "content": "{\"time\": \"10:00\"}"},
+   {"role": "assistant", "content": "It is 10:00 in Rome.", "reasoning_content": "The tool says 10:00."}],
+ "tools": [{"type": "function", "function": {"name": "get_time", "description": "...", "parameters": {...}}}]}
+```
+
+## Install
 
 ```bash
-uv venv --python 3.12 && uv sync --extra io      # or: pip install -e ".[io]"
+uv venv --python 3.12
+uv sync --extra io            # or: pip install -e ".[io]"
+```
+
+The eka template check (`RENDER` rule) also needs `sentencepiece` and `jinja2`:
+
+```bash
+uv pip install sentencepiece jinja2
+```
+
+## Run
+
+```bash
 python examples/sft_validation.py DATA_FOLDER REPORT_FOLDER LOGS_FOLDER --tasks 32
 ```
 
-To also check the rows with the eka chat template (the `RENDER` rule, on 1 row in each 100 rows), install `sentencepiece` and `jinja2` and add:
+To also check the rows with the eka chat template, add:
 
 ```bash
---spm_path /path/eka_v0_1_1.model --chat_template_path /path/chat_template.jinja [--render_every 100]
+--spm_path /path/eka_v0_1_1.model --chat_template_path /path/chat_template.jinja --render_every 100
 ```
 
-The script reads all `.jsonl` and `.jsonl.gz` files in `DATA_FOLDER`. It skips files and folders whose name starts with `_` (logs, backups, rejects).
+- The script reads all `.jsonl` and `.jsonl.gz` files in `DATA_FOLDER`.
+- It skips files and folders whose name starts with `_` (logs, backups, rejects).
+- `--tasks` is the number of parallel processes. Each task reads a part of the files.
+- With the eka options, the script renders 1 row in each `--render_every` rows of each task.
 
-### Output
+## Output
 
 | Path | Content |
 |---|---|
 | `REPORT_FOLDER/<rank>.jsonl` | One line for each flagged row: `file_path`, `line` (1-based), `sft_flags`, `sft_info` |
 | `LOGS_FOLDER/stats.json` | Number of rows for each rule id, and `rows_flagged`, `rows_info_only`, `rows_clean` |
+| `LOGS_FOLDER/input_files.txt` | The files that the script read |
 
-### Use it in your own pipeline
+Example report line:
 
-```python
-from datatrove.pipeline.filters import SFTValidationFilter, sft_chat_adapter
-from datatrove.pipeline.readers import JsonlReader
-
-pipeline = [
-    JsonlReader("DATA_FOLDER", adapter=sft_chat_adapter),  # keeps the raw row as JSON in doc.text
-    SFTValidationFilter(),  # adds doc.metadata["sft_flags"] and doc.metadata["sft_info"]
-    ...
-]
+```json
+{"file_path": "/data/sft/part-0001.jsonl", "line": 1553, "sft_flags": ["LITERAL_backslash_n"], "sft_info": []}
 ```
 
-- `sft_chat_adapter` is necessary: SFT rows have no `text` key, so the default reader skips them.
-- `doc.metadata["sft_flags"]`: FLAG rules (the row has the problem). `doc.metadata["sft_info"]`: INFO rules (information only).
-- See [Validating SFT chat data](#validating-sft-chat-data) for all options.
+## How it works
 
-### Rules (68)
+```
+JsonlReader(adapter=sft_chat_adapter)  ->  SFTValidationFilter  ->  (your next steps, or the report writer)
+   reads one row at a time                 adds sft_flags / sft_info to the row
+```
+
+1. **The reader** reads one JSONL line and gives it to the adapter.
+2. **`sft_chat_adapter`** puts the full row, without changes, into `doc.text` as JSON. It writes the 1-based line number into `doc.metadata["line"]`. The reader adds `doc.metadata["file_path"]`.
+   The adapter is necessary: SFT rows have no `text` key, so the default reader skips them.
+3. **`SFTValidationFilter`** reads the row from `doc.text`, runs the 68 rules and writes:
+   - `doc.metadata["sft_flags"]`: FLAG rules (the row has the problem),
+   - `doc.metadata["sft_info"]`: INFO rules (information only).
+
+   It counts each rule in the step stats (`stats.json`) and sends every row to the next step.
+
+## Use it in your own pipeline
+
+```python
+from datatrove.executor import LocalPipelineExecutor
+from datatrove.pipeline.filters import SFTValidationFilter, sft_chat_adapter
+from datatrove.pipeline.readers import JsonlReader
+from datatrove.utils.sft_validation import ChatTemplateRenderCheck
+
+LocalPipelineExecutor(
+    pipeline=[
+        JsonlReader("DATA_FOLDER", adapter=sft_chat_adapter),
+        SFTValidationFilter(
+            # optional: eka template check on 1 row in each 100 rows
+            render_check=ChatTemplateRenderCheck("/path/eka_v0_1_1.model", "/path/chat_template.jinja"),
+            render_every=100,
+        ),
+        ...
+    ],
+    tasks=32,
+    logging_dir="LOGS_FOLDER",
+).run()
+```
+
+`SFTValidationFilter` options:
+
+| Option | Default | Meaning |
+|---|---|---|
+| `label_only` | `True` | `True`: only flag. `False`: also remove rows with a FLAG rule (the first rule id is the `filter_reason`) |
+| `flags_key` | `"sft_flags"` | Metadata key for the FLAG rule ids |
+| `info_key` | `"sft_info"` | Metadata key for the INFO rule ids |
+| `render_check` | `None` | `ChatTemplateRenderCheck(spm_path, chat_template_path)` to enable the `RENDER` rule |
+| `render_every` | `100` | Render 1 row in each `render_every` rows of each task |
+| `exclusion_writer` | `None` | Writer for the removed rows (only with `label_only=False`) |
+
+You can also check one row without a pipeline:
+
+```python
+from datatrove.utils.sft_validation import row_issues, split_flags
+
+issues = row_issues({"messages": [{"role": "user", "content": "Hi"}, {"role": "user", "content": "Hi"}]})
+flags, info = split_flags(issues)   # (['AUDIT_does_not_end_with_assistant', 'AUDIT_user_user'], [])
+```
+
+## Rules (68)
 
 | Group | Rules | Label |
 |---|---|---|
@@ -64,757 +133,40 @@ pipeline = [
 | Empty content | `AUDIT_empty_user`, `AUDIT_empty_assistant`, `AUDIT_final_answer_empty` | FLAG |
 | Reasoning in the answer text | `THINK_in_content`, `AUDIT_think_tag_left`, `AUDIT_other_reasoning_tags`, `EMBED_reasoning_tag`, `REASON_in_answer`, `GEN_artifact_in_answer`, `RC_equals_answer`, `AUDIT_reasoning_is_problem_creation` | FLAG |
 | Tool calls, tool results and turns hidden in the text | `TOOLCALL_as_text`, `EMBED_tool_call_text`, `EMBED_tool_result_text`, `EMBED_role_turns`, `EMBED_agent_text_protocol`, `SYS_tools_promised_but_no_tools`, `USER_embedded_transcript`, `USER_python_repr_messages` | FLAG |
-| Special tokens and template render | `AUDIT_special_token_leak`, `EKA_T1`, `RENDER` (only with `--spm_path` and `--chat_template_path`) | FLAG |
+| Special tokens and template render | `AUDIT_special_token_leak`, `EKA_T1`, `RENDER` (only with the eka options) | FLAG |
 | Text quality | `AUDIT_replacement_char`, `AUDIT_mojibake`, `AUDIT_control_chars`, `AUDIT_repetition_loop`, `AUDIT_harness_error_text`, `AUDIT_output_limit_loop`, `AUDIT_degenerate_answer`, `AUDIT_answer_equals_prompt`, `LITERAL_backslash_n`, `CODE_newlines_collapsed`, `PDF_hard_line_breaks` | FLAG |
 | Safety, identity and sources | `BACKDOOR`, `IDENTITY`, `SRC_incorrect_solutions` | FLAG |
 | Information only | `END_single_call`, `END_traj_stops`, `AUDIT_unfilled_template`, `INFO_as_an_AI_language_model` | INFO |
 
 Some rule ids have a detail after the name, for example `FORMAT_bad_shape:messages_not_list`, `EKA_T1_assistant`, `IDENTITY_OpenAI_ChatGPT` or `RENDER_render_mismatch:think`.
 
-### Code
+Each rule has a flagged and a correct example row in [`tests/pipeline/filters/sft_rule_examples.json`](tests/pipeline/filters/sft_rule_examples.json).
+
+## Code
 
 | Path | Content |
 |---|---|
 | [`src/datatrove/pipeline/filters/sft_validation_filter.py`](src/datatrove/pipeline/filters/sft_validation_filter.py) | `SFTValidationFilter` (the pipeline step) and `sft_chat_adapter` |
-| [`src/datatrove/utils/sft_validation/`](src/datatrove/utils/sft_validation) | The rules: `audit.py` (base rules), `rules.py` (all other rules), `render.py` (eka template check) |
+| [`src/datatrove/utils/sft_validation/audit.py`](src/datatrove/utils/sft_validation/audit.py) | Base rules (`AUDIT_*`): structure, OpenAI format, empty turns, text quality |
+| [`src/datatrove/utils/sft_validation/rules.py`](src/datatrove/utils/sft_validation/rules.py) | All other rules, and `row_issues` (runs all rules on one row) |
+| [`src/datatrove/utils/sft_validation/render.py`](src/datatrove/utils/sft_validation/render.py) | `ChatTemplateRenderCheck` (eka template check) |
 | [`examples/sft_validation.py`](examples/sft_validation.py) | Script that writes the report of flagged rows |
-| [`tests/pipeline/filters/test_sft_validation.py`](tests/pipeline/filters/test_sft_validation.py) | Tests, with a flagged and a correct example row for each rule |
+| [`tests/pipeline/filters/test_sft_validation.py`](tests/pipeline/filters/test_sft_validation.py) | Tests |
 
-### Known limits
+## Tests
+
+```bash
+python -m pytest -sv tests/pipeline/filters/test_sft_validation.py
+```
+
+The tests check that:
+- for each of the 68 rules, the flagged example gets the rule and the correct example gets no FLAG rule,
+- OpenAI-format breaks and hidden content are flagged, and correct rows pass,
+- the filter keeps every row, writes `sft_flags` / `sft_info` and counts the rules,
+- the reader with `sft_chat_adapter` gives the correct line numbers.
+
+## Known limits
 
 - Lines that are not valid JSON are skipped by the reader with a warning. They are not flagged (no `AUDIT_bad_json`).
 - `JsonlReader` stops with an error on lines that are valid JSON but not an object (for example `null` or `[1, 2]`).
-- The eka template check renders 1 row in each `render_every` rows of each task.
-
-## Table of contents
-
-<!-- toc -->
-
-- [SFT validation (this fork)](#sft-validation-this-fork)
-- [Installation](#installation)
-- [Quickstart examples](#quickstart-examples)
-- [Terminology](#terminology)
-- [Pipeline](#pipeline)
-  * [DataTrove Document](#datatrove-document)
-  * [Types of pipeline blocks](#types-of-pipeline-blocks)
-  * [Full pipeline](#full-pipeline)
-- [Executors](#executors)
-  * [LocalPipelineExecutor](#localpipelineexecutor)
-  * [SlurmPipelineExecutor](#slurmpipelineexecutor)
-  * [RayPipelineExecutor](#raypipelineexecutor)
-  * [JobsPipelineExecutor](#jobspipelineexecutor)
-- [Logging](#logging)
-- [DataFolder / paths](#datafolder--paths)
-- [Practical guides](#practical-guides)
-  * [Reading data](#reading-data)
-  * [Synthetic data generation](#synthetic-data-generation)
-    + [Custom rollouts](#custom-rollouts)
-    + [Ready-to-use generation script](#ready-to-use-generation-script)
-    + [Advanced configuration](#advanced-configuration)
-    + [Progress monitoring](#progress-monitoring)
-    + [Benchmarking](#benchmarking)
-  * [Extracting text](#extracting-text)
-  * [Filtering data](#filtering-data)
-    + [Validating SFT chat data](#validating-sft-chat-data)
-  * [Saving data](#saving-data)
-  * [Deduplicating data](#deduplicating-data)
-  * [Summary Statistics](#summary-statistics)
-  * [Custom blocks](#custom-blocks)
-    + [Simple data](#simple-data)
-    + [Custom function](#custom-function)
-    + [Custom block](#custom-block)
-- [Contributing](#contributing)
-- [Citation](#citation)
-
-<!-- tocstop -->
-
-## Installation
-
-Requires Python 3.10+.
-
-```bash
-uv sync
-```
-Available flavours (combine them by repeating `--extra`, e.g. `uv sync --extra processing --extra s3`):
-- `all` installs everything: `uv sync --extra all`
-- `io` dependencies to read `warc/arc/wet` files and arrow/parquet/[Optimized-parquet](https://huggingface.co/docs/hub/en/datasets-libraries#optimized-parquet-files) formats: `uv sync --extra io`
-- `processing` dependencies for text extraction, filtering and tokenization: `uv sync --extra processing`
-- `s3` s3 support: `uv sync --extra s3`
-- `cli` for command line tools: `uv sync --extra cli`
-- `ray` for distributed compute engine: `uv sync --extra ray`
-- `inference` for LLM inference pipelines: `uv sync --extra inference`
-- `decont` for decontamination with lighteval: `uv sync --extra decont`
-- `multilingual` for multilingual text processing: `uv sync --extra multilingual`
-
-## Quickstart examples
-You can check the following [examples](examples):
-- [fineweb.py](examples/fineweb.py) full reproduction of the [FineWeb dataset](https://huggingface.co/datasets/HuggingFaceFW/fineweb)
-- [process_common_crawl_dump.py](examples/process_common_crawl_dump.py) full pipeline to read commoncrawl warc files, extract their text content, filters and save the resulting data to s3. Runs on slurm
-- [tokenize_c4.py](examples/tokenize_c4.py) reads data directly from huggingface's hub to tokenize the english portion of the C4 dataset using the `gpt2` tokenizer
-- [estimate_tokens.py](examples/estimate_tokens.py) estimate total token counts for large HF datasets — needed to set the correct `SamplerFilter` rate when creating a random shuffled subsample (e.g. 100B tokens from a multi-trillion-token dataset). Streams a small sample per dataset, converges on the average tokens/doc, and multiplies by the total row count.
-- [smol_data.py](examples/smol_data.py) builds ~100B token subsets, 50-30-20 mixtures, and shuffled variants for several large Hugging Face datasets
-- [minhash_deduplication.py](examples/minhash_deduplication.py) full pipeline to run minhash deduplication of text data
-- [sentence_deduplication.py](examples/sentence_deduplication.py) example to run sentence level exact deduplication
-- [exact_substrings.py](examples/exact_substrings.py) example to run ExactSubstr (requires [this repo](https://github.com/google-research/deduplicate-text-datasets))
-- [finephrase.py](examples/inference/finephrase.py) standalone example to generate a synthetic dataset at scale with multiple prompt templates
-
-## Terminology
-- `pipeline`: a list of processing steps to execute (read data, filter, write to disk, etc)
-- `executor`: runs a specific pipeline on a given execution environment (slurm, multi cpu machine, etc)
-- `job`: the execution of a pipeline on a given executor
-- `task`: a `job` is comprised of multiple `tasks`, and these are used to parallelize execution, usually by having each `task` process a `shard` of data. Datatrove keeps track of which tasks have completed and when you relaunch only incomplete tasks will run.
-- `file`: an individual input file (.json, .csv, etc).
-> [!TIP]
-> Note that each file will be processed by a single `task`. Datatrove does not automatically split a file into multiple parts, so to fully parallelize you should have multiple medium sized files rather than a single large file)
-- `shard`: a group of input data (usually a group of `file`s), which will be assigned to a specific `task`. Each `task` will process a different non overlapping `shard` of data, from the full list of input files
-- `worker`: compute resource that will execute a single task at a time, e.g., if you have 50 cpu cores you can run a LocalPipelineExecutor with `workers=50`, to execute 50 `tasks` simultaneously (one per cpu). Once a `worker` is done with a `task`, it will start processing another waiting `task`
-
-> [!TIP]
-> Your number of `tasks` controls how much you can parallelize and also how much time each individual processing unit will take. If you have a small number of tasks (and they each therefore have to process a large number of files) and they fail, you will have to restart from scratch, whereas if you have a larger number of small tasks each failed task will take way less time to rerun.
-
-> [!CAUTION]
-> If your `tasks` > `files`, some tasks will not process any data, so there usually isn't a point in setting `tasks` to a number larger than `files`.
-
-### Example 
-Running a `job` to process **10000** `files`, on a machine with **100** cpu cores (`workers`). If we choose to use **1000** tasks, each one will process a `shard` of 10 files. `workers=100` means that we can process **100** tasks at a time.
-
-## Pipeline
-### DataTrove Document
-Each pipeline block processes data in the datatrove [`Document`](src/datatrove/data.py) format:
-- `text` the actual text content for each sample
-- `id` a unique id (string) for this sample
-- `metadata` a dictionary where any additional info may be stored
-
-### Types of pipeline blocks
-Each pipeline block takes a generator of `Document` as input and returns another generator of `Document`.
-- **[readers](src/datatrove/pipeline/readers)** read data from different formats and yield `Document`
-- **[writers](src/datatrove/pipeline/writers)** save `Document` to disk/cloud in different formats
-- **[extractors](src/datatrove/pipeline/extractors)** extract text content from raw formats (such as webpage html)
-- **[filters](src/datatrove/pipeline/filters)** filter out (remove) some `Document`s based on specific rules/criteria
-- **[stats](src/datatrove/pipeline/stats)** blocks to collect statistics on the dataset
-- **[tokens](src/datatrove/pipeline/tokens)** blocks to tokenize data or count tokens
-- **[dedup](src/datatrove/pipeline/dedup)** blocks for deduplication
-### Full pipeline
-A pipeline is defined as a list of pipeline blocks. As an example, the following pipeline would read data from disk, randomly filter (remove) some documents and write them back to disk:
-```python
-from datatrove.pipeline.readers import CSVReader
-from datatrove.pipeline.filters import SamplerFilter
-from datatrove.pipeline.writers import JsonlWriter
-
-pipeline = [
-    CSVReader(
-        data_folder="/my/input/path"
-    ),
-    SamplerFilter(rate=0.5),
-    JsonlWriter(
-        output_folder="/my/output/path"
-    )
-]
-```
-
-## Executors
-Pipelines are platform-agnostic, which means that the same pipeline can smoothly run on different execution environments without any changes to its steps. Each environment has its own PipelineExecutor.
-
-Some options common to all executors:
-- `pipeline` a list consisting of the pipeline steps that should be run
-- `logging_dir` a datafolder where log files, statistics and more should be saved. Do not reuse folders for different pipelines/jobs as this will overwrite your stats, logs and completions.
-- `skip_completed` (_bool_, `True` by default) datatrove keeps track of completed tasks so that when you relaunch a job they can be skipped. Set this to `False` to disable this behaviour
-- `randomize_start_duration` (_int_, `0` by default) the maximum number of seconds to delay the start of each task to prevent all tasks from starting simultaneously and potentially overloading the system. 
-
-Call an executor's `run` method to execute its pipeline.
-
-
-> [!TIP]
-> Datatrove keeps track of which tasks successfully completed by creating a marker (an empty file) in the `${logging_dir}/completions` folder. Once the job finishes, if some of its tasks have failed, you can **simply relaunch the exact same executor** and datatrove will check and only run the tasks that were not previously completed.
-
-> [!CAUTION]
-> If you relaunch a pipeline because some tasks failed, **do not change the total number of tasks** as this will affect the distribution of input files/sharding.
-
-
-
-### LocalPipelineExecutor
-This executor will launch a pipeline on a local machine.
-Options:
-- `tasks` total number of tasks to run
-- `workers` how many tasks to run simultaneously. If `-1`, no limit. Anything `> 1` will use multiprocessing to execute the tasks.
-- `start_method` method to use to spawn a multiprocessing Pool. Ignored if `workers` is 1
-
-<details>
-  <summary>Example executor</summary>
-
-```python
-from datatrove.executor import LocalPipelineExecutor
-executor = LocalPipelineExecutor(
-    pipeline=[
-        ...
-    ],
-    logging_dir="logs/",
-    tasks=10,
-    workers=5
-)
-executor.run()
-```
-</details>
-
-<details>
-  <summary>Multi-node parallelism</summary>
-
-You can have different nodes/machines process different parts of the total tasks by using the `local_tasks` and `local_rank_offset`. For each node/instance/machine, launch with the following options:
-- `tasks` the total tasks to be executed (across all machines). **This value must be the same on each machine or the input file distribution may overlap!** Example: 500
-- `local_tasks` how many tasks of the total will be executed on this particular machine. Note that you can use different values for each machine. Example: 100
-- `local_rank_offset` the rank of the first task to be executed on this machine. If this is the 3rd machine where you are launching a job, and the 2 previous machines each ran 250 and 150 jobs, this would be `400` for the current machine.
-
-To get final merged stats you will have to invoke the `merge_stats` script manually on a path containing the stats from all machines.
-</details>
-
-### SlurmPipelineExecutor
-This executor will launch a pipeline on a slurm cluster, using slurm job arrays to group and manage tasks.
-Options:
-- `tasks` total number of tasks to run. **required**
-- `time` slurm time limit string. **required**
-- `partition` slurm partition. **required**
-- `workers` how many tasks to run simultaneously. If `-1`, no limit. Slurm will run `workers` tasks at a time. (default: `-1`)
-- `job_name` slurm job name (default: "data_processing)
-- `depends` another SlurmPipelineExecutor instance, which will be a dependency of this pipeline (current pipeline will only start executing after the depended on pipeline successfully completes)
-- `sbatch_args` dictionary with any other arguments you would like to pass to sbatch
-- `slurm_logs_folder` where to save the slurm log files. If using a local path for `logging_dir`, they will be saved on `logging_dir/slurm_logs`. If not, they will be saved as a subdir of the current directory.
-<details>
-  <summary>Other options</summary>
-
-- `cpus_per_task` how many cpus to give each task (default: `1`)
-- `qos` slurm qos (default: "normal")
-- `mem_per_cpu_gb` memory per cpu, in GB (default: 2)
-- `env_command` custom command to activate a python environment, if needed
-- `condaenv` conda environment to activate
-- `venv_path` path to a python environment to activate
-- `max_array_size` the _MaxArraySize_ value in `$ scontrol show config`. If number of tasks exceeds this number, it will split into multiple array jobs (default: 1001)
-- `max_array_launch_parallel` if we need multiple jobs due to max_array_size, whether to launch them all in one go (parallel) or sequentially (default: `False`)
-- `stagger_max_array_jobs` when max_array_launch_parallel is True, this determines how many seconds to wait between launching each of the parallel jobs (default: `0`)
-- `run_on_dependency_fail` start executing when a job we depend on finishes even if it has failed (default: `False`)
-- `randomize_start` randomize the start of each task in a job in a ~3 min window. Useful when heavily hitting an s3 bucket for example. (default: `False`)
-</details>
-<details>
-  <summary>Example executor</summary>
-
-```python
-from datatrove.executor import SlurmPipelineExecutor
-executor1 = SlurmPipelineExecutor(
-    pipeline=[
-        ...
-    ],
-    job_name="my_cool_job1",
-    logging_dir="logs/job1",
-    tasks=500,
-    workers=100,  # omit to run all at once
-    time="10:00:00",  # 10 hours
-    partition="hopper-cpu"
-)
-executor2 = SlurmPipelineExecutor(
-    pipeline=[
-        ...
-    ],
-    job_name="my_cool_job2",
-    logging_dir="logs/job2",
-    tasks=1,
-    time="5:00:00",  # 5 hours
-    partition="hopper-cpu",
-    depends=executor1  # this pipeline will only be launched after executor1 successfully completes
-)
-# executor1.run()
-executor2.run() # this will actually launch executor1, as it is a dependency, so no need to launch it explicitly
-```
-</details>
-
-### RayPipelineExecutor
-This executor will launch a pipeline on a ray cluster, using ray tasks for parallel execution.
-Options:
-- `tasks` total number of tasks to run.
-- `workers` how many tasks to run simultaneously. If `-1`, no limit. Ray will run `workers` tasks at a time. (default: `-1`)
-- `depends` another RayPipelineExecutor instance, which will be a dependency of this pipeline (current pipeline will only start executing after the depended on pipeline successfully completes)
-<details>
-  <summary>Other options</summary>
-
-- `cpus_per_task` how many cpus to give each task (default: `1`)
-- `mem_per_cpu_gb` memory per cpu, in GB (default: 2)
-- `ray_remote_kwargs` Additional kwargs to pass to the ray.remote decorator
-</details>
-<details>
-  <summary>Example executor</summary>
-
-```python
-import ray
-from datatrove.executor import RayPipelineExecutor
-ray.init()
-executor = RayPipelineExecutor(
-    pipeline=[
-        ...
-    ],
-    logging_dir="logs/",
-    tasks=500,
-    workers=100,  # omit to run all at once
-)
-executor.run()
-```
-</details>
-
-### JobsPipelineExecutor
-**Experimental — may change or be removed without notice.** Runs pipelines on [Hugging Face Jobs](https://huggingface.co/docs/huggingface_hub/en/guides/jobs): same coordination model as Slurm, but each block of tasks runs in a cloud Job. See the [`JobsPipelineExecutor` docstring](src/datatrove/executor/jobs.py) and the `*_jobs.py` [examples](examples) for usage.
-
-## Logging
-For a pipeline with `logging_dir` **mylogspath/exp1**, the following folder structure would be created:
-
-<details>
-  <summary>See folder structure</summary>
-
-```
-└── mylogspath/exp1
-    │── executor.json ⟵ json dump of the executor options and pipeline steps
-    │── launch_script.slurm ⟵ the slurm config created and used to launch this job (if running on slurm)
-    │── executor.pik ⟵ the slurm config created and used to launch this job (if running on slurm)
-    │── ranks_to_run.json ⟵ list of tasks that are being run
-    │── logs/
-    │   └──[task_00000.log, task_00001.log, task_00002.log, ...] ⟵ individual logging files for each task
-    │── completions/
-    │   └──[00004, 00007, 00204, ...] ⟵ empty files marking a task as completed. Using when relaunching/resuming a job (only unfinished tasks will be run)
-    │── stats/
-    │   └──[00000.json, 00001.json, 00002.json, ...] ⟵ individual stats for each task (number of samples processed, filtered, removed, etc)
-    └── stats.json ⟵ global stats from all tasks
-```
-</details>
-
-### Colorization
-Log messages support colorization. By default, colorization will be auto detected for console messages and disabled for log files (logs/task_XXXXX.log).
-To explicitly enable or disable colorization, you may set the following environment variables:
-- `DATATROVE_COLORIZE_LOGS` "1" to add ANSI colors to console log messages and "0" to disable colorization.
-- `DATATROVE_COLORIZE_LOG_FILES` set to "1" to add ANSI colors to log messages saved to logs/task_XXXXX.log.
-
-## DataFolder / paths
-Datatrove supports a wide variety of input/output sources through [fsspec](https://filesystem-spec.readthedocs.io/en/latest/).
-
-There are a few ways to provide a path to a datatrove block (for `input_folder`, `logging_dir`, `data_folder` and so on arguments):
-- `str`: the simplest way is to pass a single string. Example: `/home/user/mydir`, `s3://mybucket/myinputdata`, `hf://buckets/myorg/my-bucket/raw/`, `hf://datasets/allenai/c4/en/`
-
-> Use `hf://buckets/...` for raw and intermediate data (S3-like, mutable, no versioning). Use `hf://datasets/...` for datasets ready to be published. See [HF Storage Buckets](#hf-storage-buckets) below.
-
-- `(str, fsspec filesystem instance)`: a string path and a fully initialized filesystem object. Example: `("s3://mybucket/myinputdata", S3FileSystem(client_kwargs={"endpoint_url": endpoint_uri}))`
-- `(str, dict)`: a string path and a dictionary with options to initialize a fs. Example (equivalent to the previous line): `("s3://mybucket/myinputdata", {"client_kwargs": {"endpoint_url": endpoint_uri}})`
-- `DataFolder`: you can initialize a [DataFolder](src/datatrove/io.py) object directly and pass it as an argument
-
-Under the hood these argument combinations are parsed by [`get_datafolder`](src/datatrove/io.py#116).
-
-## Practical guides
-
-### Reading data
-Usually, pipelines will start with a [Reader](src/datatrove/pipeline/readers) block.
-Most readers take a `data_folder` argument — a path to a folder containing the data to be read.
-
-These files will be distributed across each task. If you have `N` tasks, task with rank `i` (0-based) will process files `i, i+N, i+2N, i+3N,...`.
-
-Internally, each reader reads data and converts it into a dictionary before creating a `Document` object.
-
-Some options common to most readers:
-- `text_key` the dictionary key containing the text content for each sample. Default: `text`
-- `id_key` the dictionary key containing the id for each sample. Default: `id`
-- `default_metadata` a dictionary for any default metadata values you would like to add (such as their source, for example)
-- `recursive` whether to look for files recursively in `data_folder`'s subdirectories
-- `glob_pattern` use this field to match specific files. For instance, `glob_pattern="*/warc/*.warc.gz"` will match files with a `.warc.gz` file extension on the `warc/` folder of each of the `data_folder`'s subdirectories
-- `adapter` this function takes the raw dictionary obtained from the reader and returns a dictionary with `Document`'s field names. You may overwrite this function ([_default_adapter](src/datatrove/pipeline/readers/base.py)) if you would like.
-- `limit` read only a certain number of samples. Useful for testing/debugging
-
-### Synthetic data generation
-Install the inference extras with `uv sync --extra inference` to pull in the lightweight HTTP client, checkpointing dependencies and async sqlite cache.
-
-We support [vLLM](https://github.com/vllm-project/vllm), [SGLang](https://github.com/sgl-project/sglang), OpenAI-compatible HTTPS endpoints and a local `dummy` server through the [InferenceRunner block](src/datatrove/pipeline/inference/run_inference.py). Each datatrove task can spin up its own server replica (for `vllm`, `sglang` or `dummy`) or talk directly to an external endpoint while asynchronous batching keeps GPU utilization high.
-
-#### Custom rollouts
-
-The core abstraction is a **rollout function**—a plain async callable that receives a `Document`, a `generate(payload)` callback, and any extra kwargs from `shared_context`. You can freely orchestrate multiple sequential or parallel `generate` calls inside the rollout. This gives you full control over how prompts are constructed and how generations are combined. See [inference_chunked.py](examples/inference/inference_chunked.py) for examples of:
-- Simple single-request rollouts
-- Chunked rollouts that split long documents and stitch generations together
-- CPU-heavy preprocessing with process pools via `shared_context`
-- Multi-node distributed inference
-
-Set `rollouts_per_document` to automatically run the same rollout multiple times per sample; the runner collects successful outputs under `document.metadata["rollout_results"]`.
-
-#### Ready-to-use generation script
-
-For a ready-to-use script for synthetic data generation at scale (supporting models from 1B to 1T parameters, local/SLURM execution, and multi-node setups), see [`generate_data.py`](examples/inference/generate_data.py). This script handles prompt-based generation with configurable system prompts and templates.
-
-> For raw generation output, write to `hf://buckets/<org>/<bucket>/...` (or use `HuggingFaceBucketWriter`) and only promote the cleaned, ready-to-share data to `hf://datasets/...`. See [HF Storage Buckets](#hf-storage-buckets).
-
-#### Advanced configuration
-
-`shared_context` lets you inject shared state into every rollout invocation. It accepts:
-- a dict (passed through as keyword arguments),
-- a callable returning a dict (handy for lazily creating resources),
-- a context manager or a callable returning one (great for pools, GPU allocators, temp dirs, etc.). Context managers are properly entered/exited once per task.
-
-Recoverable generation:
-- Setting `checkpoints_local_dir` together with `records_per_chunk` writes every `Document` to local chunk files (remember to include `${chunk_index}` in the output filename template), then uploads them via the configured writer. Failed tasks automatically resume from the last finished chunk.
-- When checkpointing is enabled a sqlite-backed `RequestCache` deduplicates individual rollouts via payload hashes (requires `xxhash` and `aiosqlite`) so completed generations are never re-sent during retries.
-- Set `skip_bad_requests=True` on `InferenceRunner` to skip provider-side `BadRequestError`s (for example, context/window overflows) and keep the remaining documents running.
-
-Tune batching with `max_concurrent_generations` and, when pre/post-processing is heavy, raise `max_concurrent_documents` to allow more rollout coroutines to build payloads while requests are in flight.
-
-<details>
-  <summary>Minimal end-to-end example</summary>
-
-  ```
-  from datatrove.data import Document
-  from datatrove.executor.local import LocalPipelineExecutor
-  from datatrove.pipeline.inference.run_inference import InferenceConfig, InferenceRunner
-  from datatrove.pipeline.writers import JsonlWriter
-
-  async def simple_rollout(doc: Document, generate):
-      payload = {"messages": [{"role": "user", "content": [{"type": "text", "text": doc.text}]}], "max_tokens": 2048}
-      return await generate(payload)
-
-  documents = [Document(text="What's the weather in Tokyo?", id=str(i)) for i in range(1005)]
-  config = InferenceConfig(server_type="vllm", model_name_or_path="google/gemma-3-27b-it", rollouts_per_document=1, max_concurrent_generations=500)
-
-  LocalPipelineExecutor(
-      pipeline=[
-          documents,
-          InferenceRunner(
-              rollout_fn=simple_rollout,
-              config=config,
-              skip_bad_requests=True,
-              records_per_chunk=500,
-              checkpoints_local_dir="/fsx/.../translate-checkpoints",
-              output_writer=JsonlWriter("s3://.../final_output_data", output_filename="${rank}_chunk_${chunk_index}.jsonl"),
-          ),
-      ],
-      logging_dir="/fsx/.../inference_logs",
-      tasks=1,
-  ).run()
-  ```
-</details>
-
-The extended [inference_chunked.py](examples/inference/inference_chunked.py) script demonstrates single- and multi-rollout flows, resumable checkpoints and sharing a process pool across rollouts.
-
-#### Progress monitoring
-
-For long-running inference jobs, you can use `InferenceProgressMonitor` to periodically update a HuggingFace dataset card with a progress bar and ETA. After inference completes, `InferenceDatasetCardGenerator` creates a final dataset card with statistics.
-
-```python
-from datatrove.pipeline.inference import InferenceDatasetCardParams, InferenceProgressMonitor, InferenceDatasetCardGenerator
-
-params = InferenceDatasetCardParams(
-    output_repo_id="your-username/output-dataset",
-    input_dataset_name="simplescaling/s1K-1.1",
-    input_dataset_split="train",
-    model_name="Qwen/Qwen3-0.6B",
-    # ... other params
-)
-
-# Monitor pipeline (runs in parallel with inference on Slurm)
-monitor_pipeline = [InferenceProgressMonitor(params=params, update_interval=3600)]
-
-# Final card generation (runs after inference completes)
-datacard_pipeline = [InferenceDatasetCardGenerator(params=params)]
-```
-
-See [progress_monitoring.py](examples/inference/progress_monitoring.py) for a complete example with Slurm integration.
-
-#### Benchmarking
-
-To measure vLLM throughput across different models and configurations (TP, PP, speculative decoding), use the [benchmark tools](examples/inference/benchmark/README.md). The benchmark suite provides:
-- **`launch_experiments.py`**: Launch sweep experiments from YAML config with automatic Slurm job submission
-- **`analyze_results.py`**: Parse server logs and generate CSV summaries with metrics like tokens/s per GPU and GPU-days to process 1B tokens
-
-### Extracting text
-You can use [extractors](src/datatrove/pipeline/extractors) to extract text content from raw html. The most commonly used extractor in datatrove is [Trafilatura](src/datatrove/pipeline/extractors/trafilatura.py), which uses the [trafilatura](https://trafilatura.readthedocs.io/en/latest/) library.
-
-### Filtering data
-[Filters](src/datatrove/pipeline/filters) are some of the most important blocks of any data processing pipeline. Datatrove's filter blocks take a `Document` and return a boolean (`True` to keep a document, `False` to remove it). Removed samples do not continue to the next pipeline stage. You can also save the removed samples to disk by passing a [Writer](src/datatrove/pipeline/writers) to the `exclusion_writer` parameter.
-
-#### Validating SFT chat data
-[`SFTValidationFilter`](src/datatrove/pipeline/filters/sft_validation_filter.py) checks SFT rows in the OpenAI chat format (`{"messages": [...], "tools": [...]}`) and **only flags** them: it adds the broken rule ids to `doc.metadata["sft_flags"]` (FLAG rules) and `doc.metadata["sft_info"]` (information only), counts every rule in the step stats, and keeps every document. A row passes when reasoning is only in `reasoning_content`, tool calls only in `tool_calls`, tool results only in `role: "tool"` messages, and the text has no template tokens or hidden turns. The rules are in [`datatrove.utils.sft_validation`](src/datatrove/utils/sft_validation).
-
-Read the rows with `sft_chat_adapter`, which keeps each raw row unchanged as JSON in `text` and stores the 1-based line number in `metadata["line"]`:
-```python
-from datatrove.pipeline.filters import SFTValidationFilter, sft_chat_adapter
-from datatrove.pipeline.readers import JsonlReader
-
-pipeline = [
-    JsonlReader("data/sft/", adapter=sft_chat_adapter),
-    SFTValidationFilter(),  # label_only=True: nothing is removed
-    ...
-]
-```
-Pass `render_check=ChatTemplateRenderCheck(spm_path, chat_template_path)` to also render every `render_every`-th row with the training chat template (needs `sentencepiece` and `jinja2`). See [examples/sft_validation.py](examples/sft_validation.py) for a pipeline that writes a report of the flagged rows (file, line, rule ids).
-
-Note: `JsonlReader` skips lines that are not valid JSON (they are not flagged) and fails on lines that are valid JSON but not an object (e.g. `null`).
-
-### Saving data
-Once you are done processing your data you will probably want to save it somewhere. For this you can use a [writer](src/datatrove/pipeline/writers/jsonl.py).
-Writers require an `output_folder` (the path where data should be saved). You can choose the `compression` to use (default: `gzip`) and the filename to save each file as.
-For the `output_filename`, a template is applied using the following arguments:
-- `${rank}` replaced with the current task's rank. Note that if this tag isn't present, **different tasks may try to write to the same location**
-- `${id}` replaced with the sample id
-- metadata: any other `${tag}` will be replaced with the corresponding `document.metadata['tag']` value
-
-An example to separate samples by language based on their `lang` metadata field:
-```
-JsonlWriter(
-    f"{MAIN_OUTPUT_PATH}/non_english/",
-    output_filename="${language}/" + DUMP + "/${rank}.jsonl.gz",  # folder structure: language/dump/file
-)
-```
-
-#### Where to write data on the Hugging Face Hub
-
-For Hub-backed output, prefer **buckets for raw / intermediate data** and
-**datasets for the published, ready-to-share version**. Both have dedicated writers:
-
-```python
-from datatrove.pipeline.writers import HuggingFaceBucketWriter, HuggingFaceDatasetWriter
-
-# Recommended for raw / intermediate output of large pipelines:
-HuggingFaceBucketWriter(
-    bucket="myorg/my-bucket",
-    prefix="v1/raw",                # path inside the bucket
-    private=True,
-    overwrite=True,                  # delete existing files at prefix first (default: False = append)
-)
-
-# Use this when promoting the final dataset to a published HF dataset:
-HuggingFaceDatasetWriter(
-    dataset="myorg/my-dataset",
-    private=True,
-)
-```
-
-See [HF Storage Buckets](#hf-storage-buckets) for the full picture (including
-direct fsspec writes, `hf-mount`, and HF Jobs volume mounts).
-
-### HF Storage Buckets
-
-Hugging Face [storage buckets](https://huggingface.co/docs/hub/storage-buckets) are
-S3-like, mutable object storage backed by Xet. They are the recommended destination
-for raw and intermediate data; promote the final, ready-to-publish version to a
-dataset (`hf://datasets/...`).
-
-You can read from and write to buckets in four ways — pick the one that fits your
-deployment:
-
-| Approach | When to use |
-| --- | --- |
-| `HuggingFaceBucketWriter` | Large datasets, staged Xet uploads, auto-create the bucket. Supports `overwrite=True` to replace existing files. |
-| Direct fsspec path (`hf://buckets/...`) on any reader/writer | Simple read/write through `HfFileSystem`; no extra setup. |
-| [`hf-mount`](https://huggingface.co/docs/hub/storage-buckets-mount) (FUSE/NFS) | Best read performance with zero code changes; treat the bucket like a local dir. |
-| [HF Jobs volume mounts](https://huggingface.co/docs/huggingface_hub/main/guides/jobs#volume-mounts) | Zero setup when running on HF infra; the bucket is mounted at the path you choose. |
-
-Reading uses the existing `ParquetReader` / `JsonlReader` blocks — no dedicated
-bucket reader is needed because buckets are raw object storage. See
-[`examples/bucket_synthetic_data.py`](examples/bucket_synthetic_data.py) for a
-side-by-side comparison of all four approaches.
-
-```python
-from datatrove.pipeline.readers import ParquetReader
-from datatrove.pipeline.writers import HuggingFaceBucketWriter
-
-# Reading: any reader with an hf://buckets/... path works.
-reader = ParquetReader(data_folder="hf://buckets/myorg/my-bucket/raw/")
-
-# Writing: HuggingFaceBucketWriter stages files locally, then pushes via Xet.
-# Set overwrite=True to replace existing files at the prefix (default: append).
-writer = HuggingFaceBucketWriter(
-    bucket="myorg/my-bucket",
-    prefix="v1/filtered",
-    private=True,
-    cleanup=True,
-    overwrite=True,
-)
-```
-
-Bucket URLs also work as `logging_dir` on any executor, e.g.
-`logging_dir="hf://buckets/myorg/my-bucket/logs/v1"`.
-
-### Deduplicating data
-For deduplication check the examples [minhash_deduplication.py](examples/minhash_deduplication.py), [sentence_deduplication.py](examples/sentence_deduplication.py) and [exact_substrings.py](examples/exact_substrings.py).
-
-### Summary Statistics
-For summary statistics on your data you can use the [Stats](https://github.com/huggingface/datatrove/tree/main/src/datatrove/pipeline/stats) blocks. These blocks provide an easy way to collect data-profiles on your dataset in a distributed manner. It's a two step process in which you first:
-1) For each shard iterate over documents and collect stats into of the following groupings `summary` (all docs counted to "summary" key), `fqdn` (fully qualified domain name grouping), `suffix` (the last part of the url path grouping) or `histogram` (value based grouping).
-2) Merge the stats from different shards into a single file.
-See the [summary_stats.py](examples/summary_stats.py) for more details.
-
-Each resulting stat is saved in a separate file with following structure: `output_folder/{fqdn,suffix,summary,histogram}/{stat_name}/metric.json`
-
-Each such file is a `MetricStatsDict` object, which you can easily load using:
-```python
-from datatrove.pipeline.stats.summary_stats import MetricStatsDict
-import json
-stats = MetricStatsDict.from_dict(json.load(open("fqdn/length/metric.json")))
-
-# E.g for total length of nytimes.com docs
-stats["nytimes.com"].total
-
-# Or for mean of cnn.com docs
-stats["cnn.com"].mean
-```
-
-Following stats are available:
-- `contamination_stats.py`: `word_contamination_{words[0]}`: Frequency of words contamination in the document.
-- `doc_stats.py`: `length`: Length of the document, `white_space_ratio`: Ratio of whitespace characters, `non_alpha_digit_ratio`: Ratio of non-alphabetic and non-digit characters, `digit_ratio`: Ratio of digits, `uppercase_ratio`: Ratio of uppercase letters, `elipsis_ratio`: Ratio of elipsis characters, `punctuation_ratio`: Punctuation ratio
-- `lang_stats.py`: `fasttext_{language}`: Score of document being written in `language`. Score is computed using FastText model.
-- `line_stats.py`: `n_lines`: Number of lines per doc, `avg_line_length`: Average length of line per doc, `long_line_ratio_chars_{chars}`: Ratio of lines with more than k chars, `short_line_ratio_chars_{chars}`: Ratio of lines with less than k chars, `bullet_point_lines_ratio`: Ratio of line starting with bullet point, `line_duplicates`: Ratio of lines that are duplicates, `line_char_duplicates`: Ratio of chars in duplicated lines to all chars.
-- `paragraph_stats.py`: `n_paragraphs`: Number of paragraphs, `avg_paragraph_length`: Average paragraph length, `short_paragraph_ratio_{chars}`: Ratio of short paragraphs (`<{chars}` chars), `long_paragraph_ratio_{chars}`: Ratio of long paragraphs (`>{chars}` chars)
-- `perplexity_stats.py`: `ccnet_perplexity_{model_dataset}_{language}`: Perplexity of the document using the CCNet model for `{model}` on `{dataset}` in `{language}`
-- `sentence_stats.py`: `n_sentences`: Number of sentences, `avg_sentence_length`: Average sentence length, `short_sentence_ratio_{chars}`: Ratio of short sentences (`<{chars}` chars), `long_sentence_ratio_{chars}`: Ratio of long sentences (`>{chars}` chars)
-- `token_stats.py`:`token_count`: Number of tokens in the document
-- `word_stats.py`: `n_words`: Number of words in the document, `avg_word_length`: Average length of words in the document, `avg_words_per_line`: Average number of words per line in the document, `short_word_ratio_{chars}`: Ratio of words shorter than `{chars}` characters, `stop_word_ratio`: Ratio of stop words, `long_word_ratio_{chars}`: Ratio of words longer than `{chars}` characters, `type_token_ratio`: Number of unique words / Number of tokens, `capitalized_word_ratio`: Ratio of capitalized words, `uppercase_word_ratio`: Ratio of uppercase words
-
-
-
-
-
-
-
-
-### Custom blocks
-
-#### Simple data
-You can pass an iterable of [`Document`](src/datatrove/data.py) directly as a pipeline block like so:
-```python
-from datatrove.data import Document
-from datatrove.pipeline.filters import SamplerFilter
-from datatrove.pipeline.writers import JsonlWriter
-
-pipeline = [
-    [
-        Document(text="some data", id="0"),
-        Document(text="some more data", id="1"),
-        Document(text="even more data", id="2"),
-    ],
-    SamplerFilter(rate=0.5),
-    JsonlWriter(
-        output_folder="/my/output/path"
-    )
-]
-```
-
-Do note, however, that this iterable will not be sharded (if you launch more than 1 task they will all get the full iterable).
-This is usually useful for small workloads/testing.
-
-#### Custom function
-For simple processing you can simply pass in a custom function with the following signature:
-```python
-from datatrove.data import DocumentsPipeline
-
-def uppercase_everything(data: DocumentsPipeline, rank: int = 0, world_size: int = 1) -> DocumentsPipeline:
-    """
-        `data` is a generator of Document. You must also return a generator of Document (yield)
-        You can optionally use `rank` and `world_size` for sharding
-    """
-    for document in data:
-        document.text = document.text.upper()
-        yield document
-
-pipeline = [
-    ...,
-    uppercase_everything,
-    ...
-]
-```
-> [!TIP]
-> You might have some pickling issues due to the imports. If this happens, simply move whatever imports you need inside the function body.
-
-#### Custom block
-You can also define a full block inheriting from [`PipelineStep`](src/datatrove/pipeline/base.py) or one of its subclasses:
-
-```python
-from datatrove.pipeline.base import PipelineStep
-from datatrove.data import DocumentsPipeline
-from datatrove.io import DataFolderLike, get_datafolder
-
-
-class UppercaserBlock(PipelineStep):
-    def __init__(self, some_folder: DataFolderLike, some_param: int = 5):
-        super().__init__()
-        # you can take whatever parameters you need and save them here
-        self.some_param = some_param
-        # to load datafolders use get_datafolder()
-        self.some_folder = get_datafolder(some_folder)
-
-    def run(self, data: DocumentsPipeline, rank: int = 0, world_size: int = 1) -> DocumentsPipeline:
-        # you could also load data from the `some_folder`:
-        for filepath in self.some_folder.get_shard(rank, world_size): # it also accepts a glob pattern, among other things
-            with self.some_folder.open(filepath, "rt") as f:
-                # do something
-                ...
-                yield doc
-
-        #
-        # OR process data from previous blocks (`data`)
-        #
-
-        for doc in data:
-            with self.track_time():
-                # you can wrap the main processing code in `track_time` to know how much each document took to process
-                nr_uppercase_letters = sum(map(lambda c: c.isupper(), doc.text))
-                # you can also keep track of stats per document using stat_update
-                self.stat_update("og_upper_letters", value=nr_uppercase_letters)
-                doc.text = doc.text.upper()
-            # make sure you keep the yield outside the track_time block, or it will affect the time calculation
-            yield doc
-
-        #
-        # OR save data to disk
-        #
-
-        with self.some_folder.open("myoutput", "wt") as f:
-            for doc in data:
-                f.write(doc...)
-```
-
-```python
-pipeline = [
-    ...,
-    UppercaserBlock("somepath"),
-    ...
-]
-```
-
-You could also inherit from [`BaseExtractor`](src/datatrove/pipeline/extractors/base.py), [`BaseFilter`](src/datatrove/pipeline/filters/base_filter.py), [`BaseReader`/`BaseDiskReader`](src/datatrove/pipeline/readers/base.py), or [`DiskWriter`](src/datatrove/pipeline/writers/disk_base.py).
-## Contributing
-
-```bash
-git clone git@github.com:huggingface/datatrove.git && cd datatrove
-uv sync --extra dev
-```
-
-Install pre-commit code style hooks:
-```bash
-pre-commit install
-```
-
-Run code style checks:
-```bash
-# Fast local loop (changed Python files only)
-make quality
-make style
-
-# Full repository checks (same scope as CI)
-make quality-full
-make style-full
-```
-
-Run the tests:
-```bash
-pytest -sv ./tests/
-```
-
-## Citation
-
-```bibtex
-@misc{penedo2024datatrove,
-  author = {Penedo, Guilherme and Kydlíček, Hynek and Cappelli, Alessandro and Sasko, Mario and Wolf, Thomas},
-  title = {DataTrove: large scale data processing},
-  year = {2024},
-  publisher = {GitHub},
-  journal = {GitHub repository},
-  url = {https://github.com/huggingface/datatrove}
-}
-```
+- The eka template check renders 1 row in each `render_every` rows of each task, not of each file.
